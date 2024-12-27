@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.NetworkDiscoveryTest" parent="Theme.AppCompat.Light.DarkActionBar">
+        <!-- 기타 테마 속성들 -->
+    </style>
+</resources>
