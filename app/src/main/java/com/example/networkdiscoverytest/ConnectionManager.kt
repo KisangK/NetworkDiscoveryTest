@@ -47,7 +47,7 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
         fun onConnectionEstablished()
         fun onConnectionFailed(error: String)
         fun onMessageReceived(message: String)
-        fun onConnectionInfoUpdated(connectionInfo: ConnectionInfo) // The app uses this to display details about both connected devices.
+        fun onConnectionInfoUpdated(connectionInfo: ConnectionInfo?) // The app uses this to display details about both connected devices.
         fun onSyncRequestReceived(items: List<SyncItem>)
         fun onSyncResponseReceived(items: List<SyncItem>)
         fun onItemAdded(item: SyncItem)
@@ -60,11 +60,25 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
 
         connectionJob = scope.launch {
             try {
-                serverSocket = ServerSocket(port)
+                /* Create a new ServerSocket with reuse address option: If the app tries to create a
+                new ServerSocket on the same port before the operating system has fully released it
+                from the previous connection, it leads to an error */
+                serverSocket = ServerSocket(port).apply {
+                    // This allows the socket to be bound even if it's in TIME_WAIT state
+                    reuseAddress = true
+                    // Set a reasonable timeout for accepting connections
+                    soTimeout = 30000 // 30 seconds
+                }
                 val socket = serverSocket?.accept() // It pauses execution until someone tries to connect
 
                 // When someone does connect, we set up our identity
                 socket?.let {
+                    // Configure the client socket for proper cleanup
+                    it.apply {
+                        keepAlive = true
+                        soTimeout = 30000 // 30 seconds timeout for operations
+                    }
+
                     // Create local device info for server
                     localDeviceInfo = NetworkDiscoveryManager.DeviceInfo(
                         deviceName = Build.MODEL,
@@ -74,7 +88,18 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
                     establishConnection(it)
                 }
             } catch (e: Exception) {
-                connectionCallback.onConnectionFailed("Server start failed: ${e.message}")
+                when {
+                    e.message?.contains("Address already in use") == true -> {
+                        connectionCallback.onConnectionFailed("Port is still in use. Please wait a moment and try again.")
+                    }
+                    e.message?.contains("Socket closed") == true -> {
+                        // Normal disconnection, no need to report as error
+                        println("Socket was closed normally")
+                    }
+                    else -> {
+                        connectionCallback.onConnectionFailed("Server start failed: ${e.message}")
+                    }
+                }
             }
         }
 
@@ -181,6 +206,19 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
                     println("Error parsing device info: ${e.message}")
                 }
             }
+            message == "DISCONNECT_REQUEST" -> {
+                // Other side wants to disconnect
+                println("Received disconnect request")
+                // Send acknowledgment
+                sendMessage("DISCONNECT_ACKNOWLEDGE")
+                // Perform local cleanup
+                performLocalDisconnect()
+            }
+            message == "DISCONNECT_ACKNOWLEDGE" -> {
+                // Other side has acknowledged our disconnect request
+                println("Received disconnect acknowledgment")
+                performLocalDisconnect()
+            }
             else -> connectionCallback.onMessageReceived(message)
         }
     }
@@ -225,15 +263,76 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
     // Get the current connection code (used by UI)
     fun getCurrentConnectionCode(): String? = currentConnectionCode
 
-    // Clean up all connections and resources
+    // Initiate a graceful disconnect
     fun disconnect() {
-        connectionJob?.cancel()
-        serverSocket?.close()
-        clientSocket?.close()
-        printWriter?.close()
-        bufferedReader?.close()
-        currentConnectionCode = null
-        localDeviceInfo = null
-        remoteDeviceInfo = null
+        if (isConnected()) {
+            try {
+                // Send disconnect request and wait briefly for acknowledgment
+                sendMessage("DISCONNECT_REQUEST")
+                // Give the other side a moment to respond
+                scope.launch {
+                    delay(1000) // Wait 1 second for acknowledgment
+                    performLocalDisconnect()
+                }
+            } catch (e: Exception) {
+                // If sending fails, just disconnect locally
+                performLocalDisconnect()
+            }
+        } else {
+            performLocalDisconnect()
+        }
+    }
+
+    // Check if we have an active connection
+    private fun isConnected(): Boolean {
+        return clientSocket?.isConnected == true && !clientSocket?.isClosed!!
+    }
+
+    // Perform the actual disconnect operations
+    private fun performLocalDisconnect() {
+        try {
+            // Cancel any ongoing coroutines first
+            connectionJob?.cancel()
+
+            // Close streams first
+            printWriter?.close()
+            bufferedReader?.close()
+
+            // Then close sockets
+            clientSocket?.let { socket ->
+                try {
+                    if (!socket.isInputShutdown) socket.shutdownInput()
+                    if (!socket.isOutputShutdown) socket.shutdownOutput()
+                    socket.close()
+                } catch (e: Exception) {
+                    println("Error closing client socket: ${e.message}")
+                }
+            }
+
+            serverSocket?.let { server ->
+                try {
+                    if (!server.isClosed) {
+                        server.close()
+                    }
+                } catch (e: Exception) {
+                    println("Error closing server socket: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            println("Error during disconnect: ${e.message}")
+        } finally {
+            // Reset all state
+            connectionJob = null
+            serverSocket = null
+            clientSocket = null
+            printWriter = null
+            bufferedReader = null
+            currentConnectionCode = null
+            localDeviceInfo = null
+            remoteDeviceInfo = null
+
+            // Notify UI
+            connectionCallback.onConnectionInfoUpdated(null)
+        }
     }
 }

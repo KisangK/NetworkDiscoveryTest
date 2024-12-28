@@ -10,24 +10,13 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
-import com.example.networkdiscoverytest.ui.theme.NetworkDiscoveryTestTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -266,23 +255,42 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         }
     }
 
-    override fun onConnectionInfoUpdated(connectionInfo: ConnectionManager.ConnectionInfo) {
+    override fun onConnectionInfoUpdated(connectionInfo: ConnectionManager.ConnectionInfo?) {
         runOnUiThread {
-            // Dismiss the connection code dialog if we're the server
-            connectionCodeDialog?.dismiss()
+            if (connectionInfo != null) {
+                // We have a valid connection - handle the connected state
 
-            // Update UI with both local and remote device information
-            updateConnectionStatus(
-                "Connected",
-                connectionInfo.localDevice,
-                connectionInfo.remoteDevice
-            )
-            isConnected = true
-            updateButtonStates()
+                // Dismiss the connection code dialog if we're the server
+                connectionCodeDialog?.dismiss()
 
-            connectionManager.sendSyncMessage(
-                ConnectionManager.SyncMessage.SyncRequest(syncItems)
-            )
+                // Update UI with both local and remote device information
+                updateConnectionStatus(
+                    "Connected",
+                    connectionInfo.localDevice,
+                    connectionInfo.remoteDevice
+                )
+
+                // Update connection state and UI elements
+                isConnected = true
+                updateButtonStates()
+
+                // Initiate data synchronization
+                connectionManager.sendSyncMessage(
+                    ConnectionManager.SyncMessage.SyncRequest(syncItems)
+                )
+            } else {
+                // Connection info is null, meaning we're disconnected
+
+                // Update the UI to show disconnected state
+                updateConnectionStatus("Disconnected")
+
+                // Reset connection state
+                isConnected = false
+                updateButtonStates()
+
+                // Clear the displayed device information
+                connectedDeviceInfo.visibility = View.GONE
+            }
         }
     }
 
