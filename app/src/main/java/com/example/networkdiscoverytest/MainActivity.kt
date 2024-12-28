@@ -30,6 +30,9 @@ import androidx.recyclerview.widget.RecyclerView
 import com.example.networkdiscoverytest.ui.theme.NetworkDiscoveryTestTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
     // Core managers for network discovery and connection
@@ -51,12 +54,20 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
     private var selectedDevice: NetworkDiscoveryManager.DeviceInfo? = null
     private var isConnected = false
 
+    // List to store sync items
+    private val syncItems = mutableListOf<SyncItem>()
+    private lateinit var recyclerViewSync: RecyclerView
+    private lateinit var syncAdapter: SyncAdapter
+    private lateinit var addItemButton: Button
+    private lateinit var editText: EditText
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         setupNetworkManagers()
         setupViews()
+        setupSyncViews()
     }
 
     private fun setupNetworkManagers() {
@@ -131,6 +142,34 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
                 val devices = networkDiscoveryManager.getDiscoveredDevices()
                 devicesAdapter.submitList(devices)
                 delay(1000) // Update every second
+            }
+        }
+    }
+
+    private fun setupSyncViews() {
+        recyclerViewSync = findViewById(R.id.recyclerViewSync)
+        addItemButton = findViewById(R.id.addItemButton)
+        editText = findViewById(R.id.editText)
+
+        syncAdapter = SyncAdapter(syncItems)
+        recyclerViewSync.apply {
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            adapter = syncAdapter
+        }
+
+        addItemButton.setOnClickListener {
+            val text = editText.text.toString()
+            if (text.isNotEmpty()) {
+                val newItem = SyncItem(text = text)
+                addSyncItem(newItem)
+                editText.text.clear()
+
+                // Send to connected device
+                if (isConnected) {
+                    connectionManager.sendSyncMessage(
+                        ConnectionManager.SyncMessage.ItemAdded(newItem)
+                    )
+                }
             }
         }
     }
@@ -212,6 +251,12 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         disconnectButton.isEnabled = isConnected
     }
 
+    private fun addSyncItem(item: SyncItem) {
+        syncItems.add(item)
+        syncItems.sortByDescending { it.timestamp }
+        syncAdapter.notifyDataSetChanged()
+    }
+
     // ConnectionManager.ConnectionCallback implementation
     override fun onConnectionEstablished() {
         runOnUiThread {
@@ -234,6 +279,10 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
             )
             isConnected = true
             updateButtonStates()
+
+            connectionManager.sendSyncMessage(
+                ConnectionManager.SyncMessage.SyncRequest(syncItems)
+            )
         }
     }
 
@@ -266,6 +315,38 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
             updateConnectionStatus("Connection Failed")
             updateButtonStates()
             Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onSyncRequestReceived(items: List<SyncItem>) {
+        // Merge received items with our items
+        val merged = (syncItems + items)
+            .distinctBy { it.id }
+            .sortedByDescending { it.timestamp }
+
+        runOnUiThread {
+            syncItems.clear()
+            syncItems.addAll(merged)
+            syncAdapter.notifyDataSetChanged()
+
+            // Send our merged list back
+            connectionManager.sendSyncMessage(
+                ConnectionManager.SyncMessage.SyncResponse(merged)
+            )
+        }
+    }
+
+    override fun onSyncResponseReceived(items: List<SyncItem>) {
+        runOnUiThread {
+            syncItems.clear()
+            syncItems.addAll(items)
+            syncAdapter.notifyDataSetChanged()
+        }
+    }
+
+    override fun onItemAdded(item: SyncItem) {
+        runOnUiThread {
+            addSyncItem(item)
         }
     }
 
@@ -317,4 +398,30 @@ class DevicesAdapter(
             itemView.setOnClickListener { onDeviceSelected(device) }
         }
     }
+}
+
+class SyncAdapter(private val items: List<SyncItem>) :
+    RecyclerView.Adapter<SyncAdapter.ViewHolder>() {
+
+    class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        val textView: TextView = view.findViewById(android.R.id.text1)
+
+        fun bind(item: SyncItem) {
+            val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+                .format(Date(item.timestamp))
+            textView.text = "${item.text} ($time)"
+        }
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
+        val view = LayoutInflater.from(parent.context)
+            .inflate(android.R.layout.simple_list_item_1, parent, false)
+        return ViewHolder(view)
+    }
+
+    override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+        holder.bind(items[position])
+    }
+
+    override fun getItemCount() = items.size
 }
