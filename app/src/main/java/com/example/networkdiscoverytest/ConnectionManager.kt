@@ -26,6 +26,8 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
     private var isServer = false
     private var localDeviceInfo: NetworkDiscoveryManager.DeviceInfo? = null // Represents this device
     private var remoteDeviceInfo: NetworkDiscoveryManager.DeviceInfo? = null // Represents the device we're connecting to
+    private var connectionState = ConnectionState.DISCONNECTED // Represents the connection state of the device
+
 
     // Data class to hold complete connection information
     data class ConnectionInfo(
@@ -40,6 +42,13 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
         data class SyncResponse(val items: List<SyncItem>) : SyncMessage()
         // Represents a real-time update when a new item is created
         data class ItemAdded(val item: SyncItem) : SyncMessage()
+    }
+
+    // List of available connection states
+    private enum class ConnectionState {
+        DISCONNECTED,
+        CONNECTING,
+        CONNECTED
     }
 
     // Interface for communicating connection events back to the UI
@@ -108,23 +117,34 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
 
     // Start client mode (device initiating connection)
     fun connectToServer(ip: String, port: Int) {
-        isServer = false
-        connectionJob = scope.launch {
-            try {
-                withTimeout(10000) { // 10-second connection timeout
-                    val socket = Socket(ip, port) // Attempts to establish the network connection
-                    // If the connection succeeds, we immediately create our device's identity card
-                    localDeviceInfo = NetworkDiscoveryManager.DeviceInfo(
-                        deviceName = Build.MODEL,
-                        ipAddress = socket.localAddress.hostAddress ?: "unknown",
-                        port = socket.localPort
-                    )
-                    establishConnection(socket)
+        when (connectionState) {
+            ConnectionState.CONNECTED -> {
+                connectionCallback.onConnectionFailed("Already connected to another device. Please disconnect first.")
+                return
+            }
+            ConnectionState.CONNECTING -> {
+                connectionCallback.onConnectionFailed("Connection attempt already in progress.")
+                return
+            }
+            ConnectionState.DISCONNECTED -> {
+                isServer = false
+                connectionState = ConnectionState.CONNECTING
+
+                connectionJob = scope.launch {
+                    try {
+                        withTimeout(10000) {
+                            val socket = Socket(ip, port)
+                            localDeviceInfo = NetworkDiscoveryManager.DeviceInfo(
+                                deviceName = Build.MODEL,
+                                ipAddress = socket.localAddress.hostAddress ?: "unknown",
+                                port = socket.localPort
+                            )
+                            establishConnection(socket)
+                        }
+                    } catch (e: Exception) {
+                        handleConnectionError(e)
+                    }
                 }
-            } catch (e: TimeoutCancellationException) {
-                connectionCallback.onConnectionFailed("Connection timed out")
-            } catch (e: Exception) {
-                connectionCallback.onConnectionFailed("Connection failed: ${e.message}")
             }
         }
     }
@@ -140,6 +160,7 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
             // The Announcement Phase:
             println("Connection established with ${socket.inetAddress.hostAddress}:${socket.port}")
             localDeviceInfo?.let { sendDeviceInfo(it) }
+            connectionState = ConnectionState.CONNECTED
             connectionCallback.onConnectionEstablished()
 
             // The Listening Phase: It starts a continuous listening loop in a coroutine (background task)
@@ -155,7 +176,7 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
                 }
             }
         } catch (e: Exception) {
-            connectionCallback.onConnectionFailed("Failed to establish connection: ${e.message}")
+            handleConnectionError(e)
         }
     }
 
@@ -229,6 +250,17 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
         sendMessage(message)
     }
 
+    private fun handleConnectionError(e: Exception) {
+        connectionState = ConnectionState.DISCONNECTED
+        when (e) {
+            is TimeoutCancellationException ->
+                connectionCallback.onConnectionFailed("Connection timed out")
+            else ->
+                connectionCallback.onConnectionFailed("Connection failed: ${e.message}")
+        }
+        performLocalDisconnect()
+    }
+
     // Send a message to the connected device
     fun sendMessage(message: String) {
         scope.launch {
@@ -265,7 +297,7 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
 
     // Initiate a graceful disconnect
     fun disconnect() {
-        if (isConnected()) {
+        if (connectionState != ConnectionState.DISCONNECTED) {
             try {
                 // Send disconnect request and wait briefly for acknowledgment
                 sendMessage("DISCONNECT_REQUEST")
@@ -330,6 +362,7 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
             currentConnectionCode = null
             localDeviceInfo = null
             remoteDeviceInfo = null
+            connectionState = ConnectionState.DISCONNECTED
 
             // Notify UI
             connectionCallback.onConnectionInfoUpdated(null)
