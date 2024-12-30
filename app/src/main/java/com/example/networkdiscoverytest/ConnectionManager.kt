@@ -9,6 +9,8 @@ import java.io.PrintWriter
 import java.net.ServerSocket
 import java.net.Socket
 import kotlinx.coroutines.*
+import java.net.ProtocolException
+import java.net.SocketTimeoutException
 
 class ConnectionManager(private val connectionCallback: ConnectionCallback) {
     // Socket-related properties for network communication
@@ -19,15 +21,34 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
 
     // Coroutine-related properties for asynchronous operations
     private var connectionJob: Job? = null
+    private var verificationJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + Job())
 
     // Properties to track connection state and device information
     private var currentConnectionCode: String? = null
+    private var isVerified = false
     private var isServer = false
-    private var localDeviceInfo: NetworkDiscoveryManager.DeviceInfo? = null // Represents this device
-    private var remoteDeviceInfo: NetworkDiscoveryManager.DeviceInfo? = null // Represents the device we're connecting to
     private var connectionState = ConnectionState.DISCONNECTED // Represents the connection state of the device
 
+    // Device information
+    private var localDeviceInfo: NetworkDiscoveryManager.DeviceInfo? = null // Represents this device
+    private var remoteDeviceInfo: NetworkDiscoveryManager.DeviceInfo? = null // Represents the device we're connecting to
+
+    // Protocol constants
+    companion object {
+        private const val PROTOCOL_VERSION = "1.0"
+        private const val VERIFICATION_TIMEOUT = 30000L // 30 seconds
+        private const val SOCKET_TIMEOUT = 30000 // 30 seconds
+        private const val BUFFER_SIZE = 8192
+    }
+
+    // List of available connection states
+    private enum class ConnectionState {
+        DISCONNECTED,
+        VERIFYING,
+        CONNECTING,
+        CONNECTED
+    }
 
     // Data class to hold complete connection information
     data class ConnectionInfo(
@@ -44,11 +65,9 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
         data class ItemAdded(val item: SyncItem) : SyncMessage()
     }
 
-    // List of available connection states
-    private enum class ConnectionState {
-        DISCONNECTED,
-        CONNECTING,
-        CONNECTED
+    sealed class VerificationResult {
+        data object Success : VerificationResult()
+        data class Failure(val reason: String) : VerificationResult()
     }
 
     // Interface for communicating connection events back to the UI
@@ -64,8 +83,19 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
 
     // Start server mode (device accepting connections)
     fun startServer(port: Int): String {
+        if (connectionState != ConnectionState.DISCONNECTED) {
+            throw IllegalStateException("Cannot start server: already ${connectionState.name.lowercase()}")
+        }
+
         isServer = true
         currentConnectionCode = generateConnectionCode()
+        connectionState = ConnectionState.VERIFYING
+
+        /* Use a separate socket for verification.
+                Once the verification is complete, the verification socket is closed */
+        var verificationSocket: Socket? = null
+        var verificationReader: BufferedReader? = null
+        var verificationWriter: PrintWriter? = null
 
         connectionJob = scope.launch {
             try {
@@ -73,41 +103,79 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
                 new ServerSocket on the same port before the operating system has fully released it
                 from the previous connection, it leads to an error */
                 serverSocket = ServerSocket(port).apply {
-                    // This allows the socket to be bound even if it's in TIME_WAIT state
-                    reuseAddress = true
-                    // Set a reasonable timeout for accepting connections
-                    soTimeout = 30000 // 30 seconds
+                    reuseAddress = true // This allows the socket to be bound even if it's in TIME_WAIT state
+                    soTimeout = SOCKET_TIMEOUT // timeout for accepting connections
+                    receiveBufferSize = BUFFER_SIZE // the buffer that holds incoming data
                 }
-                val socket = serverSocket?.accept() // It pauses execution until someone tries to connect
 
-                // When someone does connect, we set up our identity
-                socket?.let {
-                    // Configure the client socket for proper cleanup
-                    it.apply {
-                        keepAlive = true
-                        soTimeout = 30000 // 30 seconds timeout for operations
+                while (isActive && connectionState == ConnectionState.VERIFYING) {
+                    try {
+                        // Accept verification connection with timeout
+                        withTimeout(VERIFICATION_TIMEOUT) {
+                            verificationSocket = serverSocket?.accept() // It pauses execution until someone tries to connect
+                        }
+
+                        // Move on if connected
+                        verificationSocket?.let { socket ->
+                            socket.apply {
+                                keepAlive = true
+                                soTimeout = SOCKET_TIMEOUT
+                                receiveBufferSize = BUFFER_SIZE
+                                sendBufferSize = BUFFER_SIZE
+                                tcpNoDelay = true
+                            }
+
+                            verificationReader = BufferedReader(
+                                InputStreamReader(socket.getInputStream())
+                            )
+
+                            verificationWriter = PrintWriter(
+                                socket.getOutputStream(),
+                                true
+                            )
+
+                            val verificationResult = handleServerVerification(
+                                verificationReader!!,
+                                verificationWriter!!
+                            )
+
+                            when (verificationResult) {
+                                is VerificationResult.Success -> {
+                                    // Verification successful, prepare for data connection
+                                    isVerified = true
+                                    connectionState = ConnectionState.CONNECTING
+
+                                    // Accept the main data connection
+                                    val dataSocket = serverSocket?.accept()
+                                    dataSocket?.let {
+                                        configureDataSocket(it)
+                                        establishSecureConnection(it)
+                                    }
+                                }
+                                is VerificationResult.Failure -> {
+                                    connectionCallback.onConnectionFailed(verificationResult.reason)
+                                    connectionState = ConnectionState.DISCONNECTED
+                                }
+                            }
+                        }
+                    } catch (e: TimeoutCancellationException) {
+                        connectionCallback.onConnectionFailed("Verification timed out")
+                        break
                     }
-
-                    // Create local device info for server
-                    localDeviceInfo = NetworkDiscoveryManager.DeviceInfo(
-                        deviceName = Build.MODEL,
-                        ipAddress = socket.localAddress.hostAddress ?: "unknown",
-                        port = socket.localPort
-                    )
-                    establishConnection(it)
                 }
             } catch (e: Exception) {
-                when {
-                    e.message?.contains("Address already in use") == true -> {
-                        connectionCallback.onConnectionFailed("Port is still in use. Please wait a moment and try again.")
-                    }
-                    e.message?.contains("Socket closed") == true -> {
-                        // Normal disconnection, no need to report as error
-                        println("Socket was closed normally")
-                    }
-                    else -> {
-                        connectionCallback.onConnectionFailed("Server start failed: ${e.message}")
-                    }
+                handleConnectionError(e)
+            } finally {
+                // Clean up verification resources
+                safeClose(verificationReader)
+                safeClose(verificationWriter)
+                safeClose(verificationSocket)
+
+                if (connectionState != ConnectionState.CONNECTED) {
+                    // Only close server socket if connection wasn't established
+                    safeClose(serverSocket)
+                    connectionState = ConnectionState.DISCONNECTED
+                    isVerified = false
                 }
             }
         }
@@ -116,67 +184,162 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
     }
 
     // Start client mode (device initiating connection)
-    fun connectToServer(ip: String, port: Int) {
-        when (connectionState) {
-            ConnectionState.CONNECTED -> {
-                connectionCallback.onConnectionFailed("Already connected to another device. Please disconnect first.")
-                return
-            }
-            ConnectionState.CONNECTING -> {
-                connectionCallback.onConnectionFailed("Connection attempt already in progress.")
-                return
-            }
-            ConnectionState.DISCONNECTED -> {
-                isServer = false
-                connectionState = ConnectionState.CONNECTING
+    fun connectToServer(ip: String, port: Int, connectionCode: String) {
+        if (connectionState != ConnectionState.DISCONNECTED) {
+            connectionCallback.onConnectionFailed(
+                "Cannot connect: already ${connectionState.name.lowercase()}"
+            )
+            return
+        }
 
-                connectionJob = scope.launch {
-                    try {
-                        withTimeout(10000) {
-                            val socket = Socket(ip, port)
-                            localDeviceInfo = NetworkDiscoveryManager.DeviceInfo(
-                                deviceName = Build.MODEL,
-                                ipAddress = socket.localAddress.hostAddress ?: "unknown",
-                                port = socket.localPort
-                            )
-                            establishConnection(socket)
-                        }
-                    } catch (e: Exception) {
-                        handleConnectionError(e)
+        isServer = false
+        connectionState = ConnectionState.VERIFYING
+
+        verificationJob = scope.launch {
+            var verificationSocket: Socket? = null
+            var verificationReader: BufferedReader? = null
+            var verificationWriter: PrintWriter? = null
+
+            try {
+                withTimeout(VERIFICATION_TIMEOUT) {
+                    verificationSocket = Socket(ip, port).apply {
+                        keepAlive = true
+                        soTimeout = SOCKET_TIMEOUT
+                        receiveBufferSize = BUFFER_SIZE
+                        sendBufferSize = BUFFER_SIZE
+                        tcpNoDelay = true
                     }
+                    verificationReader = BufferedReader(
+                        InputStreamReader(verificationSocket!!.getInputStream())
+                    )
+                    verificationWriter = PrintWriter(
+                        verificationSocket!!.getOutputStream(),
+                        true
+                    )
+
+                    // Send verification code
+                    verificationWriter?.println(connectionCode)
+
+                    // Wait for verification response
+                    val response = verificationReader?.readLine()
+
+                    when {
+                        response == null ->
+                            throw Exception("No verification response received")
+
+                        response == "VERIFICATION_SUCCESS" -> {
+                            // Verification successful, establish data connection
+                            isVerified = true
+                            connectionState = ConnectionState.CONNECTING
+
+                            // Create main data connection
+                            val dataSocket = Socket(ip, port)
+                            configureDataSocket(dataSocket)
+                            establishSecureConnection(dataSocket)
+                        }
+
+                        response.startsWith("VERIFICATION_FAILED:") -> {
+                            val reason = response.substringAfter("VERIFICATION_FAILED:")
+                            throw Exception("Verification failed: $reason")
+                        }
+
+                        else -> throw Exception("Invalid verification response")
+                    }
+                }
+            } catch (e: Exception) {
+                handleConnectionError(e)
+            } finally {
+                // Clean up verification resources
+                safeClose(verificationReader)
+                safeClose(verificationWriter)
+                safeClose(verificationSocket)
+
+                if (connectionState != ConnectionState.CONNECTED) {
+                    connectionState = ConnectionState.DISCONNECTED
+                    isVerified = false
                 }
             }
         }
     }
 
-    // Set up connection streams and start message handling
-    private fun establishConnection(socket: Socket) {
-        try {
-            clientSocket = socket
-            // Auto-flushing: Messages are sent immediately rather than being buffered.
-            printWriter = PrintWriter(socket.getOutputStream(), true)
-            bufferedReader = BufferedReader(InputStreamReader(socket.getInputStream()))
+    private fun handleServerVerification(
+        reader: BufferedReader,
+        writer: PrintWriter
+    ): VerificationResult {
+        return try {
+            val receivedCode = reader.readLine()
+                ?: return VerificationResult.Failure("No verification code received")
 
-            // The Announcement Phase:
-            println("Connection established with ${socket.inetAddress.hostAddress}:${socket.port}")
-            localDeviceInfo?.let { sendDeviceInfo(it) }
-            connectionState = ConnectionState.CONNECTED
-            connectionCallback.onConnectionEstablished()
-
-            // The Listening Phase: It starts a continuous listening loop in a coroutine (background task)
-            scope.launch {
-                try {
-                    while (isActive) {
-                        val message = bufferedReader?.readLine() ?: throw Exception("Connection closed by peer")
-                        println("Received message: $message")
-                        handleMessage(message)
-                    }
-                } catch (e: Exception) {
-                    connectionCallback.onConnectionFailed("Communication error: ${e.message}")
-                }
+            if (verifyConnectionCode(receivedCode)) {
+                writer.println("VERIFICATION_SUCCESS")
+                VerificationResult.Success
+            } else {
+                writer.println("VERIFICATION_FAILED:Invalid code")
+                VerificationResult.Failure("Invalid connection code")
             }
         } catch (e: Exception) {
+            VerificationResult.Failure("Verification error: ${e.message}")
+        }
+    }
+
+    private fun configureDataSocket(socket: Socket) {
+        socket.apply {
+            keepAlive = true
+            receiveBufferSize = BUFFER_SIZE
+            sendBufferSize = BUFFER_SIZE
+            tcpNoDelay = true
+        }
+
+        localDeviceInfo = NetworkDiscoveryManager.DeviceInfo(
+            deviceName = Build.MODEL,
+            ipAddress = socket.localAddress.hostAddress ?: "unknown",
+            port = socket.localPort
+        )
+        println("Debug: Local device info set - ${localDeviceInfo}")
+
+        localDeviceInfo?.let { deviceInfo ->
+            val message = "DEVICE_INFO:${deviceInfo.deviceName}|${deviceInfo.ipAddress}|${deviceInfo.port}"
+            sendMessage(message)
+            println("Debug: Sent device info to peer - $message")
+        }
+    }
+
+    private fun establishSecureConnection(socket: Socket) {
+        if (!isVerified) {
+            throw SecurityException("Attempting to establish connection without verification")
+        }
+
+        try {
+            clientSocket = socket
+            printWriter = PrintWriter(socket.getOutputStream(), true) //Auto-flushing: Messages are sent immediately rather than being buffered.
+            bufferedReader = BufferedReader(InputStreamReader(socket.getInputStream()))
+
+            connectionState = ConnectionState.CONNECTED
+
+            // Start the message handling loop. It starts a continuous listening loop in a coroutine (background task)
+            startMessageHandling()
+
+            // Notify successful connection
+            connectionCallback.onConnectionEstablished()
+
+        } catch (e: Exception) {
             handleConnectionError(e)
+            throw e
+        }
+    }
+
+    private fun startMessageHandling() {
+        scope.launch {
+            try {
+                while (isActive && connectionState == ConnectionState.CONNECTED) {
+                    val message = bufferedReader?.readLine() ?: throw Exception("Connection closed by peer")
+                    handleMessage(message)
+                }
+            } catch (e: Exception) {
+                if (connectionState == ConnectionState.CONNECTED) {
+                    handleConnectionError(e)
+                }
+            }
         }
     }
 
@@ -210,18 +373,24 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
             }
             message.startsWith("DEVICE_INFO:") -> {
                 try {
+                    println("Debug: Received DEVICE_INFO message - $message")
                     val parts = message.substringAfter("DEVICE_INFO:").split("|")
                     remoteDeviceInfo = NetworkDiscoveryManager.DeviceInfo(
                         deviceName = parts[0],
                         ipAddress = parts[1],
                         port = parts[2].toInt()
                     )
+                    println("Debug: Remote device info set - $remoteDeviceInfo")
+
 
                     // Notify UI of complete connection info when both devices are known
                     if (localDeviceInfo != null) {
+                        println("Debug: Both device infos available, updating UI")
                         connectionCallback.onConnectionInfoUpdated(
                             ConnectionInfo(localDeviceInfo!!, remoteDeviceInfo!!)
                         )
+                    } else {
+                        println("Debug: Local device info still null after receiving remote info")
                     }
                 } catch (e: Exception) {
                     println("Error parsing device info: ${e.message}")
@@ -251,14 +420,24 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
     }
 
     private fun handleConnectionError(e: Exception) {
-        connectionState = ConnectionState.DISCONNECTED
-        when (e) {
-            is TimeoutCancellationException ->
-                connectionCallback.onConnectionFailed("Connection timed out")
-            else ->
-                connectionCallback.onConnectionFailed("Connection failed: ${e.message}")
+        val errorMessage = when (e) {
+            is TimeoutCancellationException -> "Connection timed out"
+            is SocketTimeoutException -> "Connection timed out"
+            is ProtocolException -> "Protocol error: ${e.message}"
+            is SecurityException -> e.message ?: "Security error"
+            else -> "Connection error: ${e.message}"
         }
+
+        connectionCallback.onConnectionFailed(errorMessage)
         performLocalDisconnect()
+    }
+
+    private fun safeClose(closeable: AutoCloseable?) {
+        try {
+            closeable?.close()
+        } catch (e: Exception) {
+            println("Error closing resource: ${e.message}")
+        }
     }
 
     // Send a message to the connected device
@@ -310,14 +489,7 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
                 // If sending fails, just disconnect locally
                 performLocalDisconnect()
             }
-        } else {
-            performLocalDisconnect()
         }
-    }
-
-    // Check if we have an active connection
-    private fun isConnected(): Boolean {
-        return clientSocket?.isConnected == true && !clientSocket?.isClosed!!
     }
 
     // Perform the actual disconnect operations
@@ -325,36 +497,19 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
         try {
             // Cancel any ongoing coroutines first
             connectionJob?.cancel()
+            verificationJob?.cancel()
 
-            // Close streams first
-            printWriter?.close()
-            bufferedReader?.close()
-
-            // Then close sockets
-            clientSocket?.let { socket ->
-                try {
-                    if (!socket.isInputShutdown) socket.shutdownInput()
-                    if (!socket.isOutputShutdown) socket.shutdownOutput()
-                    socket.close()
-                } catch (e: Exception) {
-                    println("Error closing client socket: ${e.message}")
-                }
-            }
-
-            serverSocket?.let { server ->
-                try {
-                    if (!server.isClosed) {
-                        server.close()
-                    }
-                } catch (e: Exception) {
-                    println("Error closing server socket: ${e.message}")
-                }
-            }
+            // Close all resources
+            safeClose(printWriter)
+            safeClose(bufferedReader)
+            safeClose(clientSocket)
+            safeClose(serverSocket)
         } catch (e: Exception) {
             println("Error during disconnect: ${e.message}")
         } finally {
             // Reset all state
             connectionJob = null
+            verificationJob = null
             serverSocket = null
             clientSocket = null
             printWriter = null
@@ -362,10 +517,12 @@ class ConnectionManager(private val connectionCallback: ConnectionCallback) {
             currentConnectionCode = null
             localDeviceInfo = null
             remoteDeviceInfo = null
+            isVerified = false
             connectionState = ConnectionState.DISCONNECTED
 
             // Notify UI
             connectionCallback.onConnectionInfoUpdated(null)
         }
     }
+    class ProtocolException(message: String) : Exception(message)
 }
