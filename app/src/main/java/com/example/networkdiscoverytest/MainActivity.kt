@@ -78,11 +78,6 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         prepareConnectionButton = findViewById(R.id.prepareConnectionButton)
         disconnectButton = findViewById(R.id.disconnectButton)
 
-        // Initialize sync components
-        recyclerViewSync = findViewById(R.id.recyclerViewSync)
-        addItemButton = findViewById(R.id.addItemButton)
-        editText = findViewById(R.id.editText)
-
         // Set up the RecyclerView adapter for discovered devices
         devicesAdapter = DevicesAdapter { device ->
             if (!isConnected) {
@@ -99,16 +94,52 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
             adapter = devicesAdapter
         }
 
-        setupButtonListeners()
+        // Set up search button behavior
+        searchButton.setOnClickListener {
+            if (!isConnected) {
+                networkDiscoveryManager.startDiscovery()
+                Toast.makeText(this, "Searching for devices...", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Please disconnect first", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // Set up prepare connection button behavior
+        prepareConnectionButton.setOnClickListener {
+            if (!isConnected) {
+                startServerMode()
+            } else {
+                Toast.makeText(this, "Already connected", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // Configure the disconnect button
+        disconnectButton.setOnClickListener {
+            if (isConnected) {
+                performDisconnect()
+            } else {
+                Toast.makeText(this, "Not connected to any device", Toast.LENGTH_SHORT).show()
+            }
+        }
 
         // Update visibility based on connection state
         updateButtonStates()
 
-        // Start periodic device list updates
-        startDeviceListUpdates()
+        // Periodically update the device list
+        lifecycleScope.launch {
+            while (true) {
+                val devices = networkDiscoveryManager.getDiscoveredDevices()
+                devicesAdapter.submitList(devices)
+                delay(1000) // Update every second
+            }
+        }
     }
 
     private fun setupSyncViews() {
+        recyclerViewSync = findViewById(R.id.recyclerViewSync)
+        addItemButton = findViewById(R.id.addItemButton)
+        editText = findViewById(R.id.editText)
+
         syncAdapter = SyncAdapter(syncItems)
         recyclerViewSync.apply {
             layoutManager = LinearLayoutManager(this@MainActivity)
@@ -132,87 +163,30 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         }
     }
 
-    private fun setupButtonListeners() {
-        // Search button - start discovering devices
-        searchButton.setOnClickListener {
-            if (!isConnected) {
-                networkDiscoveryManager.startDiscovery()
-                Toast.makeText(this, "Searching for devices...", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "Please disconnect first", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        // Prepare connection button - start server mode
-        prepareConnectionButton.setOnClickListener {
-            if (!isConnected) {
-                startServerMode()
-            } else {
-                Toast.makeText(this, "Already connected", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        // Disconnect button - end the current connection
-        disconnectButton.setOnClickListener {
-            if (isConnected) {
-                performDisconnect()
-            } else {
-                Toast.makeText(this, "Not connected to any device", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-
-
-    private fun startDeviceListUpdates() {
-        lifecycleScope.launch {
-            while (true) {
-                val devices = networkDiscoveryManager.getDiscoveredDevices()
-                devicesAdapter.submitList(devices)
-                delay(1000) // Update every second
-            }
-        }
-    }
-
     private fun updateConnectionStatus(
         status: String,
         localDevice: NetworkDiscoveryManager.DeviceInfo? = null,
         remoteDevice: NetworkDiscoveryManager.DeviceInfo? = null
     ) {
-        println("Debug: Updating connection status - $status")
-        println("Debug: Local device in status update - $localDevice")
-        println("Debug: Remote device in status update - $remoteDevice")
-
         connectionStatusText.text = "Status: $status"
 
         if (localDevice != null && remoteDevice != null) {
-            println("Debug: Both devices present, updating device info display")
-
-            val deviceInfoText = buildString {
-                // Local device section
-                append("Your Device:\n")
-                append("Name: ${localDevice.deviceName}\n")
-                append("IP: ${localDevice.ipAddress}:${localDevice.port}\n\n")
-
-                // Remote device section
-                append("Connected Device:\n")
-                append("Name: ${remoteDevice.deviceName}\n")
-                append("IP: ${remoteDevice.ipAddress}:${remoteDevice.port}")
+            connectedDeviceInfo.text = buildString {
+                append("Local Device: ${localDevice.deviceName}\n")
+                append("IP: ${localDevice.ipAddress}\n\n")
+                append("Connected to: ${remoteDevice.deviceName}\n")
+                append("IP: ${remoteDevice.ipAddress}")
             }
-            println("Debug: Setting device info text - $deviceInfoText")
-
-            // Update the TextView and make it visible
-            connectedDeviceInfo.text = deviceInfoText
             connectedDeviceInfo.visibility = View.VISIBLE
-            println("Debug: Device info visibility set to VISIBLE")
         } else {
-            println("Debug: Missing device info, hiding device info display")
             connectedDeviceInfo.visibility = View.GONE
         }
     }
 
     private fun startServerMode() {
-        val connectionCode =  connectionManager.startServer(50000)
-        showConnectionCodeDialog(connectionCode)
+        connectionManager.startServer(50000)
+        val connectionCode = connectionManager.getCurrentConnectionCode()
+        showConnectionCodeDialog(connectionCode ?: "Error")
         updateConnectionStatus("Waiting for connection...")
     }
 
@@ -222,7 +196,6 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
             .setTitle("Ready to Connect")
             .setMessage("Connection Code: $code\nEnter this code on the other device.")
             .setPositiveButton("OK", null)
-            .setCancelable(false)  // Prevent dismissal until connection is established or failed
             .show()
     }
 
@@ -235,17 +208,10 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
             .setView(input)
             .setPositiveButton("Connect") { _, _ ->
                 val code = input.text.toString()
-                if (code.isEmpty()) {
-                    Toast.makeText(this, "Please enter a connection code", Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
                 selectedDevice?.let { device ->
-                    updateConnectionStatus("Verifying connection code...")
-                    connectionManager.connectToServer(
-                        device.ipAddress,
-                        50000,
-                        code
-                    )
+                    updateConnectionStatus("Connecting to ${device.deviceName}...")
+                    connectionManager.connectToServer(device.ipAddress, 50000)
+                    connectionManager.sendMessage(code)
                 }
             }
             .setNegativeButton("Cancel", null)
@@ -260,8 +226,6 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         // Reset the UI state
         updateConnectionStatus("Disconnected")
         updateButtonStates()
-        connectionCodeDialog?.dismiss()
-        connectionCodeDialog = null
 
         Toast.makeText(this, "Disconnected successfully", Toast.LENGTH_SHORT).show()
 
@@ -270,10 +234,10 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
     }
 
     private fun updateButtonStates() {
+        // Enable/disable buttons based on connection state
         searchButton.isEnabled = !isConnected
         prepareConnectionButton.isEnabled = !isConnected
         disconnectButton.isEnabled = isConnected
-        addItemButton.isEnabled = isConnected
     }
 
     private fun addSyncItem(item: SyncItem) {
@@ -288,7 +252,6 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
             isConnected = true
             updateConnectionStatus("Connected")
             Toast.makeText(this, "Connection successful!", Toast.LENGTH_SHORT).show()
-            updateButtonStates()
         }
     }
 
@@ -296,13 +259,9 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         runOnUiThread {
             if (connectionInfo != null) {
                 // We have a valid connection - handle the connected state
-                println("Debug: MainActivity received connection info update")
-                println("Debug: Local device - ${connectionInfo.localDevice}")
-                println("Debug: Remote device - ${connectionInfo.remoteDevice}")
 
                 // Dismiss the connection code dialog if we're the server
                 connectionCodeDialog?.dismiss()
-                connectionCodeDialog = null
 
                 // Update UI with both local and remote device information
                 updateConnectionStatus(
@@ -320,8 +279,8 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
                     ConnectionManager.SyncMessage.SyncRequest(syncItems)
                 )
             } else {
-                println("Debug: MainActivity received null connection info")
                 // Connection info is null, meaning we're disconnected
+
                 // Update the UI to show disconnected state
                 updateConnectionStatus("Disconnected")
 
@@ -363,17 +322,7 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
             isConnected = false
             updateConnectionStatus("Connection Failed")
             updateButtonStates()
-
-            // Dismiss the connection code dialog if it's showing
-            connectionCodeDialog?.dismiss()
-            connectionCodeDialog = null
-
             Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
-
-            // Restart discovery if appropriate
-            if (!isConnected) {
-                networkDiscoveryManager.startDiscovery()
-            }
         }
     }
 
@@ -413,7 +362,6 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         super.onDestroy()
         networkDiscoveryManager.cleanup()
         connectionManager.disconnect()
-        connectionCodeDialog?.dismiss()
     }
 }
 
