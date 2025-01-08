@@ -210,8 +210,7 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
                 val code = input.text.toString()
                 selectedDevice?.let { device ->
                     updateConnectionStatus("Connecting to ${device.deviceName}...")
-                    connectionManager.connectToServer(device.ipAddress, 50000)
-                    connectionManager.sendMessage(code)
+                    connectionManager.connectToServer(device.ipAddress, device.port, code)
                 }
             }
             .setNegativeButton("Cancel", null)
@@ -227,10 +226,18 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         updateConnectionStatus("Disconnected")
         updateButtonStates()
 
-        Toast.makeText(this, "Disconnected successfully", Toast.LENGTH_SHORT).show()
+        // Temporarily disable connection buttons
+        searchButton.isEnabled = false
+        prepareConnectionButton.isEnabled = false
 
-        // Restart discovery if needed
-        networkDiscoveryManager.startDiscovery()
+        //Re-enable after a short delay to prevent immediate re-connection
+        lifecycleScope.launch {
+            delay(1000)
+            searchButton.isEnabled = true
+            prepareConnectionButton.isEnabled = true
+        }
+
+        Toast.makeText(this, "Disconnected successfully", Toast.LENGTH_SHORT).show()
     }
 
     private fun updateButtonStates() {
@@ -294,33 +301,15 @@ class MainActivity : AppCompatActivity(), ConnectionManager.ConnectionCallback {
         }
     }
 
-    override fun onMessageReceived(message: String) {
-        println("Message received in MainActivity: $message")
-        if (connectionManager.verifyConnectionCode(message)) {
-            println("Connection code verified successfully")
-            connectionManager.sendMessage("CONNECTION_ACCEPTED")
-            runOnUiThread {
-                isConnected = true
-                selectedDevice?.let { device ->
-                    updateConnectionStatus("Connected")
-                }
-                Toast.makeText(this, "Connection code verified!", Toast.LENGTH_SHORT).show()
-            }
-        } else {
-            println("Connection code verification failed")
-            connectionManager.sendMessage("CONNECTION_REJECTED")
-            runOnUiThread {
-                isConnected = false
-                updateConnectionStatus("Connection Rejected")
-                Toast.makeText(this, "Invalid connection code.", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-
     override fun onConnectionFailed(error: String) {
         runOnUiThread {
             isConnected = false
-            updateConnectionStatus("Connection Failed")
+            if (!connectionManager.isServer()) {
+                updateConnectionStatus("Connection Failed")
+            } else {
+                // If we're the server, keep showing "Waiting for connection..."
+                updateConnectionStatus("Waiting for connection...")
+            }
             updateButtonStates()
             Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
         }
